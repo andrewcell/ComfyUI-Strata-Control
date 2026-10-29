@@ -55,7 +55,7 @@ No additional pip installation should be necessary in a standard compatible Comf
 Run the following command from your ComfyUI root directory:
 
 ```bash
-git clone [https://github.com/andrewcell/ComfyUI-Strata-Control.git](https://github.com/andrewcell/ComfyUI-Strata-Control.git) custom_nodes/ComfyUI-Strata-Control
+git clone https://github.com/andrewcell/ComfyUI-Strata-Control.git custom_nodes/ComfyUI-Strata-Control
 ```
 
 Restart ComfyUI, then hard-refresh your browser to reload frontend extensions.
@@ -331,22 +331,56 @@ use the same cleanup function.
 
 ### Cleanup Sequence
 
-When cleanup is enabled, the function:
+When cleanup is enabled, the updated function:
 
 1. Waits for pending GPU work to complete.
 2. Records memory usage before cleanup.
-3. Calls ComfyUI's model-unloading function.
-4. Runs Python garbage collection.
-5. Synchronizes GPU work.
-6. Releases unused GPU memory caches.
-7. Runs garbage collection and GPU synchronization again.
-8. Records memory usage after cleanup.
-9. Returns a cleanup report.
+3. Runs garbage collection and releases unused runtime/device caches, including CUDA IPC collection where available.
+4. Calls ComfyUI's model-unloading function.
+5. Runs garbage collection again after model unloading.
+6. Calls ComfyUI's device-cache cleanup function.
+7. Waits for pending GPU work to complete.
+8. If requested, performs a best-effort OS-specific memory trim.
+9. Records memory usage after cleanup and returns a report.
 
-When used inside Load, the Strata Load request is sent only after these steps finish successfully.
+The standalone Memory Cleanup node enables OS-specific trimming through
+`cleanup_comfyui_memory(trim_os_memory=True)`.
+The helper's default is `trim_os_memory=False`; other callers, including
+Load's optional pre-load cleanup, must explicitly pass `True` to enable trimming.
+This internal argument is not a new node widget.
 
-If cleanup fails, the node raises an error.
-Load does not call Strata's `/load` endpoint when its pre-load cleanup fails.
+When used inside Load, the Strata Load request is sent only after the
+synchronous cleanup function returns successfully.
+
+OS trimming errors are reported in `os_memory_trim` rather than raised by
+the trim helper. A top-level `cleanup_completed` status does not by itself
+mean OS trimming succeeded; inspect `os_memory_trim.status`.
+Other cleanup failures can still raise an error and prevent the Load request.
+
+### OS-Specific Memory Trimming
+
+| Platform | Method | Behavior |
+|---|---|---|
+| Windows | `EmptyWorkingSet()` | Requests removal of as many pages as possible from the current process's working set. Does not release private commit. |
+| Linux | `malloc_trim(0)`, when available | Attempts to return unused allocator-managed heap memory to the operating system. Not equivalent to Windows working-set trimming. |
+| Other platforms / missing API | Skipped | Reports a skipped status without calling unsupported APIs. |
+
+Windows API loading occurs only inside the Windows branch. Linux does not
+attempt to load Windows DLLs. On Linux, a missing `malloc_trim` symbol is
+reported as skipped. Its return value of zero means no memory was returned,
+not an API failure.
+
+Working-set trimming is a one-time request, not a permanent RSS limit.
+Python execution, report generation, server activity, and later workflow
+operations can bring pages back into the working set. A nonzero or growing
+RSS after trimming does not by itself indicate failure or a memory leak.
+Re-accessing trimmed pages can add page-fault overhead, so trimming is most
+useful when handing memory over to another workload rather than repeatedly
+trying to keep RSS near zero.
+
+Linux trimming only affects free memory managed by the allocator exposing
+`malloc_trim`. It does not promise to release all library caches, live tensors,
+pinned allocations, or memory managed by alternative allocators.
 
 ### Cleanup Scope
 
@@ -403,11 +437,13 @@ Memory Cleanup returns the cleanup report directly through `result`.
 |---|---|
 | `enabled` | Whether cleanup was enabled. |
 | `status` | `skipped` or `cleanup_completed`. |
+| `method` | Identifier of the primary cleanup implementation. |
 | `elapsed_seconds` | Cleanup duration, when enabled. |
 | `before` | Memory measurements before cleanup. |
 | `after` | Memory measurements after cleanup. |
 | `delta` | Differences between the cleanup measurements. |
 | `scope` | Description of the cleanup scope. |
+| `os_memory_trim` | OS-specific trim result when included by the updated implementation. Inspect its own status. |
 
 When disabled, the node returns only the enabled state and skipped status.
 
@@ -435,11 +471,11 @@ Load measurements are recorded even when pre-load cleanup is disabled.
 | `system_available_bytes` | System-wide available RAM. |
 | `comfyui_rss_bytes` | Resident memory of the ComfyUI process. |
 
-If the Windows Private Commit measurement patch is installed, reports also include:
+The updated RAM snapshot also includes:
 
 | Field | Description |
 |---|---|
-| `comfyui_private_commit_bytes` | Private committed memory of the ComfyUI process on Windows. |
+| `comfyui_private_commit_bytes` | Private committed memory of the ComfyUI process on Windows; `null` on other platforms. |
 
 ### GPU Measurements
 
@@ -467,10 +503,42 @@ For cleanup deltas:
 | `torch_allocated_released_bytes` | PyTorch allocated memory decreased. |
 | `torch_reserved_released_bytes` | PyTorch reserved memory decreased. |
 
-When the Windows Private Commit measurement patch is installed,
-`comfyui_private_commit_released_bytes` records the decrease in private committed memory.
+`comfyui_private_commit_released_bytes` records the decrease in Windows
+private committed memory. It is `null` when the measurement is unavailable.
 
-Negative values are possible.
+In the updated cleanup implementation, decrease/increase deltas are clamped
+to zero with `max(0, ...)`. A zero can therefore mean no change or a change
+in the opposite direction; inspect `before` and `after` for the actual values.
+RSS decrease is not necessarily equal to system-wide available RAM increase.
+Neither should be described as private-commit release.
+
+### OS Trim Report
+
+Example on Windows:
+
+```json
+"os_memory_trim": {
+  "status": "completed",
+  "method": "windows_empty_working_set"
+}
+```
+
+On Linux, the method is `linux_malloc_trim` and a completed call includes
+`released_any`: `true` if the allocator reports returning memory, otherwise
+`false`. Disabled, unsupported, and unavailable cases use `status: "skipped"`;
+caught failures use `status: "error"` with an error message.
+
+### Optional Pinned-Memory Diagnostics
+
+Development builds may include `pinned_memory` snapshots. These are not
+required for cleanup. If the report says `inconsistent_stats`, do not treat
+its values as a reliable measurement of pinned-cache size, and do not turn
+an invalid negative cache estimate into a claim of zero cache.
+
+The allocation-based `pinned_memory_diagnostic` test should be removed from
+normal cleanup reports after debugging because it performs an additional
+16 MiB pinned allocation. These diagnostics do not establish the owner of
+all retained private commit.
 
 System-wide RAM and device-wide GPU measurements can be affected by other processes.
 They do not isolate memory changes caused solely by this node.

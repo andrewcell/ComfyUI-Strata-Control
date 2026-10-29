@@ -9,7 +9,7 @@ from aiohttp import web
 from server import PromptServer
 import gc
 import time
-
+import sys
 import psutil
 import torch
 import comfy.model_management as model_management
@@ -115,19 +115,44 @@ def synchronize_gpu():
         torch.mps.synchronize()
 
 
+def get_ram_snapshot():
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    system_memory = psutil.virtual_memory()
+
+    private_commit = None
+
+    if sys.platform == "win32":
+        private_commit = getattr(memory_info, "private", None)
+
+        if private_commit is None:
+            private_commit = memory_info.vms
+
+    return {
+        "system_total_bytes": system_memory.total,
+        "system_available_bytes": system_memory.available,
+        "comfyui_rss_bytes": memory_info.rss,
+        "comfyui_private_commit_bytes": private_commit,
+    }
+
+
+def released_bytes(before_value, after_value):
+    if before_value is None or after_value is None:
+        return None
+
+    return max(0, before_value - after_value)
+
 def memory_snapshot():
     """Return memory measurements in bytes."""
-    ram = psutil.virtual_memory()
+    ram = get_ram_snapshot()
 
     snapshot = {
         "timestamp": time.time(),
-        "ram": {
-            "system_total_bytes": ram.total,
-            "system_available_bytes": ram.available,
-            "comfyui_rss_bytes": psutil.Process().memory_info().rss,
-        },
+        "ram": ram,
+        "pinned_memory": get_pinned_memory_snapshot(),
         "gpu": [],
     }
+
 
     if torch.cuda.is_available():
         for index in range(torch.cuda.device_count()):
@@ -155,84 +180,275 @@ def memory_snapshot():
 
     return snapshot
 
+def diagnose_pinned_memory():
+    stats_fn = getattr(
+        torch.cuda.memory,
+        "host_memory_stats",
+        None,
+    )
 
-def cleanup_comfyui_memory():
+    if not torch.cuda.is_available() or not callable(stats_fn):
+        return {
+            "status": "unavailable",
+            "torch_version": str(torch.__version__),
+        }
+
+    size_bytes = 16 * 1024 * 1024
+    before = dict(stats_fn())
+
+    tensor = torch.empty(
+        size_bytes,
+        dtype=torch.uint8,
+        pin_memory=True,
+    )
+
+    during = dict(stats_fn())
+
+    result = {
+        "status": "completed",
+        "torch_version": str(torch.__version__),
+        "requested_bytes": size_bytes,
+        "is_pinned": tensor.is_pinned(),
+        "before": before,
+        "during": during,
+        "active_bytes_increase": (
+            during["active_bytes.current"]
+            - before["active_bytes.current"]
+        ),
+        "active_requests_increase": (
+            during["active_requests.current"]
+            - before["active_requests.current"]
+        ),
+    }
+
+    del tensor
+
+    result["after_release"] = dict(stats_fn())
+
+    return result
+
+def get_pinned_memory_snapshot():
+    memory_module = getattr(torch.cuda, "memory", None)
+    stats_fn = getattr(memory_module, "host_memory_stats", None)
+
+    if not torch.cuda.is_available() or not callable(stats_fn):
+        return {
+            "supported": False,
+            "status": "unavailable",
+            "torch_version": str(torch.__version__),
+        }
+
+    try:
+        stats = dict(stats_fn())
+
+        allocated = stats.get("allocated_bytes.current")
+        active = stats.get("active_bytes.current")
+
+        valid = (
+            isinstance(allocated, int)
+            and isinstance(active, int)
+            and 0 <= active <= allocated
+        )
+
+        return {
+            "supported": True,
+            "status": "ok" if valid else "inconsistent_stats",
+            "torch_version": str(torch.__version__),
+            "allocated_bytes": allocated,
+            "active_bytes": active,
+            "cached_bytes_estimate": (
+                allocated - active if valid else None
+            ),
+            "raw_stats": stats,
+        }
+
+    except Exception as exc:
+        return {
+            "supported": True,
+            "status": "error",
+            "torch_version": str(torch.__version__),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+def trim_process_memory():
+    """Best-effort OS-specific memory trim for the current process."""
+    import ctypes
+
+    try:
+        if sys.platform == "win32":
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL(
+                "kernel32",
+                use_last_error=True,
+            )
+            psapi = ctypes.WinDLL(
+                "psapi",
+                use_last_error=True,
+            )
+
+            get_current_process = kernel32.GetCurrentProcess
+            get_current_process.argtypes = []
+            get_current_process.restype = wintypes.HANDLE
+
+            empty_working_set = psapi.EmptyWorkingSet
+            empty_working_set.argtypes = [wintypes.HANDLE]
+            empty_working_set.restype = wintypes.BOOL
+
+            if not empty_working_set(get_current_process()):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            return {
+                "status": "completed",
+                "method": "windows_empty_working_set",
+            }
+
+        if sys.platform.startswith("linux"):
+            # Resolve the allocator API already loaded in this process.
+            libc = ctypes.CDLL(None, use_errno=True)
+            malloc_trim = getattr(libc, "malloc_trim", None)
+
+            if malloc_trim is None:
+                return {
+                    "status": "skipped",
+                    "method": "linux_malloc_trim",
+                    "reason": "malloc_trim is not available",
+                }
+
+            malloc_trim.argtypes = [ctypes.c_size_t]
+            malloc_trim.restype = ctypes.c_int
+
+            released = bool(malloc_trim(0))
+
+            return {
+                "status": "completed",
+                "method": "linux_malloc_trim",
+                "released_any": released,
+            }
+
+        return {
+            "status": "skipped",
+            "method": None,
+            "reason": f"Unsupported platform: {sys.platform}",
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "method": "os_memory_trim",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+def clear_runtime_memory():
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    else:
+        accelerator = getattr(torch, "accelerator", None)
+
+        if accelerator is not None and accelerator.is_available():
+            accelerator.empty_cache()
+
+
+
+def cleanup_comfyui_memory(trim_os_memory=False):
     """
-    Complete cleanup synchronously.
-
-    Exceptions propagate: Strata must not load if cleanup fails.
+    Release unused runtime memory, unload ComfyUI models,
+    and synchronize GPU work before returning memory measurements.
     """
     synchronize_gpu()
     before = memory_snapshot()
     started = time.monotonic()
 
+    # Release unused memory before unloading models.
+    clear_runtime_memory()
     model_management.unload_all_models()
     gc.collect()
+    model_management.soft_empty_cache()
     synchronize_gpu()
 
-    model_management.soft_empty_cache(True)
+    # Optional OS-specific memory trim.
+    os_memory_trim = {
+        "status": "skipped",
+        "reason": "Disabled",
+    }
 
-    # Explicitly clear unused CUDA allocator caches on every device.
-    if torch.cuda.is_available():
-        for index in range(torch.cuda.device_count()):
-            with torch.cuda.device(index):
-                torch.cuda.empty_cache()
-
-    gc.collect()
-    synchronize_gpu()
+    if trim_os_memory:
+        os_memory_trim = trim_process_memory()
 
     after = memory_snapshot()
 
     before_gpus = {
-        gpu["index"]: gpu for gpu in before["gpu"]
+        gpu["index"]: gpu
+        for gpu in before["gpu"]
     }
+
+    gpu_delta = []
+
+    for after_gpu in after["gpu"]:
+        index = after_gpu["index"]
+        before_gpu = before_gpus.get(index)
+
+        if before_gpu is None:
+            continue
+
+        gpu_delta.append(
+            {
+                "index": index,
+                "device_free_increase_bytes": max(
+                    0,
+                    after_gpu["device_free_bytes"]
+                    - before_gpu["device_free_bytes"],
+                ),
+                "torch_allocated_released_bytes": released_bytes(
+                    before_gpu.get("torch_allocated_bytes"),
+                    after_gpu.get("torch_allocated_bytes"),
+                ),
+                "torch_reserved_released_bytes": released_bytes(
+                    before_gpu.get("torch_reserved_bytes"),
+                    after_gpu.get("torch_reserved_bytes"),
+                ),
+            }
+        )
 
     delta = {
-        # Positive means the measured memory usage decreased.
-        "comfyui_rss_released_bytes": (
-            before["ram"]["comfyui_rss_bytes"]
-            - after["ram"]["comfyui_rss_bytes"]
+        "comfyui_rss_released_bytes": released_bytes(
+            before["ram"]["comfyui_rss_bytes"],
+            after["ram"]["comfyui_rss_bytes"],
         ),
-        # System-wide metric; other processes can affect this value.
-        "system_available_increase_bytes": (
+        "comfyui_private_commit_released_bytes": released_bytes(
+            before["ram"].get("comfyui_private_commit_bytes"),
+            after["ram"].get("comfyui_private_commit_bytes"),
+        ),
+        "system_available_increase_bytes": max(
+            0,
             after["ram"]["system_available_bytes"]
-            - before["ram"]["system_available_bytes"]
+            - before["ram"]["system_available_bytes"],
         ),
-        "gpu": [],
+        "gpu": gpu_delta,
     }
-
-    for gpu in after["gpu"]:
-        previous = before_gpus[gpu["index"]]
-
-        delta["gpu"].append({
-            "index": gpu["index"],
-            "device_free_increase_bytes": (
-                gpu["device_free_bytes"]
-                - previous["device_free_bytes"]
-            ),
-            "torch_allocated_released_bytes": (
-                previous["torch_allocated_bytes"]
-                - gpu["torch_allocated_bytes"]
-            ),
-            "torch_reserved_released_bytes": (
-                previous["torch_reserved_bytes"]
-                - gpu["torch_reserved_bytes"]
-            ),
-        })
 
     return {
         "enabled": True,
         "status": "cleanup_completed",
+        "method": "runtime_cleanup_with_gpu_synchronization",
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "before": before,
         "after": after,
         "delta": delta,
+        "os_memory_trim": os_memory_trim,
+       # "pinned_memory_diagnostic": diagnose_pinned_memory(),
         "scope": (
-            "ComfyUI model unloading, garbage collection, "
-            "unused GPU cache release, and GPU synchronization. "
+            "Garbage collection, unused GPU cache release, "
+            "CUDA IPC collection when available, ComfyUI model unloading, "
+            "and GPU synchronization. "
             "Live tensors and execution-cache references are retained."
         ),
     }
+
 class ComfyUIMemoryCleanup:
     @classmethod
     def INPUT_TYPES(cls):
@@ -257,7 +473,7 @@ class ComfyUIMemoryCleanup:
 
     def run(self, enabled=True, trigger=None):
         if enabled:
-            report = cleanup_comfyui_memory()
+            report = cleanup_comfyui_memory(trim_os_memory=True)
         else:
             report = {
                 "enabled": False,
@@ -299,7 +515,7 @@ class StrataLoad(StrataUnload):
     ):
         if cleanup_before_load:
             try:
-                cleanup = cleanup_comfyui_memory()
+                cleanup = cleanup_comfyui_memory(trim_os_memory=True)
             except Exception as exc:
                 raise RuntimeError(
                     "Pre-load memory cleanup failed. "
