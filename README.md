@@ -446,6 +446,11 @@ If you need to save the image before attempting to load Strata, use a save node 
 The standard Save Image node does not provide a passthrough output in this example.
 
 ## HTTP API
+For endpoint details and server behavior, see the official
+[Strata Engine and Server Reference](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md).
+
+For model loading, unloading, and GPU sharing, see
+[Sharing the GPU with Other Programs](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md#sharing-the-gpu-with-other-programs-optional).
 
 The extension uses the following fixed endpoints:
 
