@@ -2,7 +2,7 @@
 
 A lightweight ComfyUI custom node pack for controlling an already-running Strata HTTP server.
 
-It provides a manual control panel and dedicated Load / Unload nodes for workflow integration.
+It provides a manual control panel and dedicated Load / Unload nodes for workflow integration, with optional ComfyUI memory cleanup before loading Strata.
 
 ## Features
 
@@ -10,6 +10,9 @@ It provides a manual control panel and dedicated Load / Unload nodes for workflo
 - Dedicated workflow nodes for loading and unloading Strata models.
 - Optional passthrough connections for establishing execution dependencies.
 - Cache-disabled Load and Unload nodes.
+- Optional pre-load memory cleanup, disabled by default.
+- Sequential memory cleanup and GPU synchronization before sending the Load request.
+- RAM and supported GPU memory measurements in the Load node's `result` output.
 - Configurable server URL and request timeout.
 - Optional Bearer authentication through a server-side environment variable.
 - Server-side HTTP requests to avoid browser CORS restrictions.
@@ -20,23 +23,23 @@ It provides a manual control panel and dedicated Load / Unload nodes for workflo
 |---|---|
 | Strata Control Panel | Provides manual Status, Load, and Unload buttons. |
 | Strata Unload | Sends an unload request when executed by the workflow. |
-| Strata Load | Sends a load request when executed by the workflow. |
+| Strata Load | Optionally cleans up ComfyUI memory, then sends a load request. |
 
 ## Requirements
 
 - A working ComfyUI installation.
 - Python 3.9 or newer.
-- ComfyUI's existing `aiohttp` dependency.
+- ComfyUI's existing `aiohttp`, `psutil`, and PyTorch dependencies.
 - An already-running Strata server exposing the supported HTTP endpoints.
 - Network access from the ComfyUI server to the Strata server.
 
-No additional pip installation is required in a standard compatible ComfyUI environment.
+No additional pip installation should be necessary in a standard compatible ComfyUI environment.
 
 ## Installation
 
 ### Using Git
 
-Run the following command from your ComfyUI directory:
+Run the following command from your ComfyUI root directory:
 
 ```bash
 git clone [https://github.com/andrewcell/ComfyUI-Strata-Control.git](https://github.com/andrewcell/ComfyUI-Strata-Control.git) custom_nodes/ComfyUI-Strata-Control
@@ -60,6 +63,8 @@ ComfyUI/
     └── ComfyUI-Strata-Control/
         ├── __init__.py
         ├── README.md
+        ├── images/
+        │   └── workflow.png
         └── web/
             └── control_panel.js
 ```
@@ -77,6 +82,14 @@ All three nodes provide the following settings:
 | `base_url` | `http://127.0.0.1:8080` | Root URL of the Strata server. Do not append `/v1`. |
 | `timeout_s` | `300` | HTTP request timeout in seconds. Allowed range: 1–1800. |
 | `api_key_env` | `STRATA_API_KEY` | Name of the ComfyUI server environment variable containing the Bearer token. |
+
+The Strata Load node also provides:
+
+| Setting | Default | Description |
+|---|---|---|
+| `cleanup_before_load` | `false` | Performs local ComfyUI memory cleanup and GPU synchronization before sending the Load request. |
+
+`timeout_s` applies to the HTTP request. It does not limit the duration of local memory cleanup.
 
 ### Server Address
 
@@ -154,6 +167,8 @@ Panel buttons send requests immediately. They do not enter the ComfyUI execution
 
 Use them only when it is safe to change Strata's model state. A manual request may conflict with an active Strata request or another workflow.
 
+The panel's Load button does not perform pre-load memory cleanup. To use that feature, execute a Strata Load node with `cleanup_before_load` enabled.
+
 Executing the Control Panel as part of a graph does not automatically load or unload Strata. Its graph function only passes through its optional input and returns an informational message.
 
 The panel's `last_result` display is separate from its graph `result` output. Clicking a button updates the display, not the graph output.
@@ -164,19 +179,20 @@ These nodes send HTTP requests when ComfyUI executes them as part of a workflow.
 
 ### Inputs
 
-| Input | Description |
-|---|---|
-| `base_url` | Strata server root URL. |
-| `timeout_s` | Request timeout. |
-| `api_key_env` | Environment variable name for optional authentication. |
-| `trigger` | Optional dependency input. Its value is returned through `passthrough`. |
+| Input | Available On | Description |
+|---|---|---|
+| `base_url` | Load / Unload | Strata server root URL. |
+| `timeout_s` | Load / Unload | HTTP request timeout. |
+| `api_key_env` | Load / Unload | Environment variable name for optional authentication. |
+| `cleanup_before_load` | Load only | Enables local memory cleanup before the Load request. Defaults to `false`. |
+| `trigger` | Load / Unload | Optional dependency input. Its value is returned through `passthrough`. |
 
 ### Outputs
 
 | Output | Description |
 |---|---|
-| `passthrough` | Returns the value received by `trigger` after the HTTP request succeeds. |
-| `result` | JSON-formatted response information as a string. |
+| `passthrough` | Returns the value received by `trigger` after the operation succeeds. |
+| `result` | JSON-formatted operation information as a string. Load includes memory measurements and cleanup status. |
 
 If `trigger` is not connected, `passthrough` returns `None`.
 
@@ -192,17 +208,162 @@ It does not launch Strata or restart a stopped server process.
 
 Likewise, `Strata Unload` requests model unloading; it does not terminate the Strata HTTP server process.
 
+## Memory Cleanup Before Load
+
+Set `cleanup_before_load` to `true` on the Strata Load node to enable cleanup.
+
+The default is `false`, preserving the normal Load behavior.
+
+### Cleanup Sequence
+
+When enabled, the node performs the following steps sequentially:
+
+1. Waits for pending GPU work to complete.
+2. Records memory usage before cleanup.
+3. Calls ComfyUI's model-unloading function.
+4. Runs Python garbage collection.
+5. Synchronizes GPU work.
+6. Releases unused GPU memory caches.
+7. Runs garbage collection and GPU synchronization again.
+8. Records memory usage after cleanup.
+9. Records memory usage immediately before the Load request.
+10. Sends the Strata Load request.
+11. Records memory usage after the Load response.
+12. Returns the operation report through `result`.
+
+The Load request is sent only after the local cleanup functions and GPU synchronization finish successfully.
+
+If cleanup fails, the node raises an error and does not call Strata's `/load` endpoint.
+
+### Cleanup Scope
+
+The cleanup process attempts to release memory through:
+
+- ComfyUI model unloading.
+- Python garbage collection.
+- ComfyUI's GPU cache cleanup function.
+- Explicit release of unused CUDA allocator caches where available.
+
+It does not forcibly delete:
+
+- Live tensors still referenced by the workflow.
+- Data retained by ComfyUI's execution cache.
+- Objects retained by custom-node caches.
+- The value connected to `trigger`.
+- Memory used by other processes.
+- GPU driver or runtime allocations.
+
+Cleanup completion does not mean that all RAM or VRAM is empty.
+
+No minimum free-memory threshold is enforced before loading Strata. Other processes may also allocate memory between cleanup and the Load request.
+
+### Device Support
+
+The cleanup process uses ComfyUI's memory-management functions.
+
+Explicit GPU synchronization is implemented for CUDA, XPU, and MPS where those backends are available.
+
+Detailed GPU memory measurements are currently implemented only for devices exposed through `torch.cuda`.
+
+For other backends, the report includes RAM measurements and a note that detailed GPU metrics are unavailable.
+
+## Memory Report
+
+The Strata Load node returns a JSON-formatted report through its `result` output.
+
+| Field | Description |
+|---|---|
+| `action` | Operation name: `load`. |
+| `status` | `load_request_succeeded` when the Load request passes the implemented response checks. |
+| `cleanup.enabled` | Whether pre-load cleanup was enabled. |
+| `cleanup.status` | `skipped` or `cleanup_completed`. |
+| `cleanup.elapsed_seconds` | Cleanup duration, when enabled. |
+| `cleanup.before` | Memory measurements before cleanup. |
+| `cleanup.after` | Memory measurements after cleanup. |
+| `cleanup.delta` | Differences between the cleanup measurements. |
+| `load.elapsed_seconds` | Duration of the Load request. |
+| `load.before` | Memory measurements immediately before the Load request. |
+| `load.after` | Memory measurements after the Load response. |
+| `load.api` | Strata API response information. |
+
+When cleanup is disabled, its before/after measurements and deltas are omitted. Load measurements are still recorded.
+
+### RAM Measurements
+
+| Field | Description |
+|---|---|
+| `system_total_bytes` | Total system RAM. |
+| `system_available_bytes` | System-wide available RAM. |
+| `comfyui_rss_bytes` | Resident memory of the ComfyUI process. |
+
+### GPU Measurements
+
+For each supported GPU:
+
+| Field | Description |
+|---|---|
+| `device_total_bytes` | Total device memory reported by the runtime. |
+| `device_free_bytes` | Available device memory. |
+| `device_used_bytes` | Total device memory minus available device memory. |
+| `torch_allocated_bytes` | Memory allocated through the ComfyUI process's PyTorch allocator. |
+| `torch_reserved_bytes` | Memory reserved by the ComfyUI process's PyTorch allocator. |
+
+### Interpreting Deltas
+
+All memory values are recorded in bytes.
+
+For cleanup deltas:
+
+| Field | Meaning of a Positive Value |
+|---|---|
+| `comfyui_rss_released_bytes` | ComfyUI's measured resident memory decreased. |
+| `system_available_increase_bytes` | System-wide available RAM increased. |
+| `device_free_increase_bytes` | Available GPU memory increased. |
+| `torch_allocated_released_bytes` | PyTorch allocated memory decreased. |
+| `torch_reserved_released_bytes` | PyTorch reserved memory decreased. |
+
+Negative values are possible.
+
+System-wide RAM and device-wide GPU measurements can be affected by other processes. They do not isolate memory changes caused solely by this node.
+
+The ComfyUI process's PyTorch measurements do not include allocations owned by a separate Strata process.
+
 ## Workflow Examples
 
-![ComfyUI-Strata-Control workflow examples](images/workflow.png)
+### Unload Workflows
 
-Illustrative workflow diagram showing:
+![Strata Unload workflow examples](images/unload.png)
 
-1. Unloading Strata before model loading.
-2. Unloading Strata before positive prompt encoding.
-3. Loading Strata after image generation.
+Examples of unloading Strata before:
 
-Note: Gating the positive prompt encoder does not delay independent model-loader branches.
+- Positive prompt encoding.
+- Checkpoint loading.
+
+Connect the upstream value to `trigger`, then connect `passthrough`
+to the downstream node to establish an execution dependency.
+
+Gating the positive prompt encoder does not delay independent
+model-loader branches. Gate each relevant loader branch separately.
+
+### Load Workflows
+
+![Strata Load workflow examples](images/load.png)
+
+Examples of loading Strata with:
+
+- Pre-load memory cleanup enabled and `result` connected to Preview as Text.
+- Image passthrough connected to Save Image, with cleanup disabled.
+
+`cleanup_before_load` defaults to `false`. When enabled, local memory
+cleanup and GPU synchronization finish before the Load request is sent.
+The `result` output includes cleanup status, memory measurements,
+and the Load API response.
+
+In the passthrough example, Save Image waits for the Load request to
+succeed. A cleanup or Load failure prevents that downstream save operation.
+
+Cleanup does not guarantee that all RAM or VRAM is free. Live tensors
+and execution-cache references may remain.
 
 ## Execution Ordering
 
@@ -270,11 +431,19 @@ Strata Load.trigger
        Save Image.images
 ```
 
-This makes the Load request depend on the final image.
+This makes the Load operation depend on the final image.
 
-In this arrangement, Save Image runs only after the Load request succeeds. A Load failure prevents that downstream Save Image node from executing.
+Enable `cleanup_before_load` on Strata Load if you want local memory cleanup to run before the Load request.
 
-The Load node does not unload ComfyUI models. If ComfyUI still occupies the required VRAM, release that memory separately before loading Strata.
+In this arrangement:
+
+- Save Image runs only after cleanup, if enabled, and the Load request succeed.
+- A cleanup or Load failure prevents that downstream Save Image node from executing.
+- The image connected to `trigger` remains referenced and is not removed by cleanup.
+
+If you need to save the image before attempting to load Strata, use a save node with a suitable completion or passthrough output, or another explicit dependency mechanism.
+
+The standard Save Image node does not provide a passthrough output in this example.
 
 ## HTTP API
 
@@ -301,9 +470,10 @@ The implementation:
 - Rejects `loaded: false` after a Load request.
 - Does not automatically retry failed requests.
 - Does not automatically fall back to `/v1/load` or `/v1/unload`.
-- Does not independently inspect GPU memory.
 
-A successful HTTP response does not independently prove that all GPU memory has been reclaimed.
+A successful API response does not independently prove that all GPU memory has been reclaimed or that every internal background operation has finished.
+
+Memory reports are snapshots taken around the operation, not continuous monitoring.
 
 ### ComfyUI Control Route
 
@@ -317,9 +487,21 @@ This internal route name remains unchanged regardless of the repository or insta
 
 ## Error Handling
 
-For workflow nodes, a failed request raises an error and prevents dependent nodes from executing.
+For workflow nodes, a failed operation raises an error and prevents dependent nodes from executing.
 
 For the manual panel, an error appears in the result field and an alert dialog.
+
+### Cleanup Failure
+
+If pre-load cleanup fails, Strata Load raises an error.
+
+The `/load` request is not sent.
+
+### Load Failure After Cleanup
+
+If cleanup succeeds but the Load request fails, the node raises an error containing the cleanup report and Load error information.
+
+Because execution failed, no normal `result` output is returned for that run.
 
 ### HTTP 409
 
@@ -333,6 +515,8 @@ Increase `timeout_s` if loading or unloading takes longer than the configured li
 
 A client-side timeout does not cancel an operation already accepted by Strata. Check the server state before sending another request.
 
+The HTTP timeout does not apply to local memory cleanup.
+
 ## Troubleshooting
 
 ### Nodes Do Not Appear
@@ -342,6 +526,15 @@ A client-side timeout does not cancel an operation already accepted by Strata. C
 - Restart ComfyUI.
 - Inspect the ComfyUI startup log for import errors.
 - Search for `Strata` or check the `Strata Simple` category.
+
+### Cleanup Option Does Not Appear
+
+- Confirm that the updated Python code is installed.
+- Restart ComfyUI.
+- Refresh the browser.
+- Try adding a new Strata Load node.
+
+The option is available only on Strata Load. It is not available on Strata Unload or the manual Control Panel.
 
 ### Panel Buttons Do Not Appear
 
@@ -378,6 +571,16 @@ The current implementation does not support configurable endpoint paths.
 
 Do not append `/v1` to `base_url`.
 
+### Cleanup Completes, but Memory Usage Remains High
+
+- Check whether the workflow still references model or image tensors.
+- Check for data retained in ComfyUI's execution cache.
+- Check for custom-node caches.
+- Check memory usage by other processes.
+- Review both device-wide and PyTorch-specific measurements.
+
+Cleanup completion does not guarantee that a particular amount of memory is available.
+
 ### Strata Unloads, but Generation Still Runs Out of Memory
 
 - Check whether independent ComfyUI model loaders ran before the unload request.
@@ -409,8 +612,13 @@ This extension does not add its own authentication layer to the custom ComfyUI r
 
 - Requires an already-running Strata HTTP server.
 - Does not start or stop the Strata process.
-- Does not unload ComfyUI models or clear ComfyUI's execution cache.
-- Does not poll GPU memory usage.
+- ComfyUI model unloading is attempted only when `cleanup_before_load` is enabled on Strata Load.
+- Does not forcibly delete live tensors, custom-node caches, or execution-cache references.
+- Does not clear all RAM or VRAM.
+- Does not enforce a minimum free-memory threshold before loading.
+- Records memory snapshots rather than continuously monitoring memory.
+- Detailed GPU memory reporting is limited to devices exposed through `torch.cuda`.
+- Manual Control Panel loading does not perform pre-load memory cleanup.
 - Does not prevent another client from loading Strata again.
 - Does not serialize requests across separate nodes or clients.
 - Does not provide a global pre-execution hook.
@@ -422,4 +630,6 @@ This extension does not add its own authentication layer to the custom ComfyUI r
 
 The initial package was generated and its Python syntax was checked.
 
-It has not been integration-tested against a live ComfyUI and Strata installation. Frontend compatibility, endpoint behavior, and passthrough connections should be verified in your environment before relying on automated GPU handoff.
+The subsequent pre-load cleanup changes have not been integration-tested against a live ComfyUI and Strata installation.
+
+Verify frontend compatibility, endpoint behavior, memory cleanup, memory reporting, and passthrough connections in your environment before relying on automated GPU handoff.

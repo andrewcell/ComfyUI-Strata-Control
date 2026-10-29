@@ -7,6 +7,12 @@ import urllib.error
 from urllib.parse import urlsplit
 from aiohttp import web
 from server import PromptServer
+import gc
+import time
+
+import psutil
+import torch
+import comfy.model_management as model_management
 
 WEB_DIRECTORY = "./web"
 
@@ -88,18 +94,232 @@ class StrataUnload:
         result = call_strata(base_url, self.ACTION, timeout_s, api_key_env)
         return {"ui": {"text": [result]}, "result": (trigger, result)}
 
+def synchronize_gpu():
+    """Wait for pending GPU work before continuing."""
+    if torch.cuda.is_available():
+        # Includes GPUs exposed through the PyTorch CUDA interface.
+        for index in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(index)
+
+    elif (
+        hasattr(torch, "xpu")
+        and torch.xpu.is_available()
+    ):
+        for index in range(torch.xpu.device_count()):
+            torch.xpu.synchronize(index)
+
+    elif (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        torch.mps.synchronize()
+
+
+def memory_snapshot():
+    """Return memory measurements in bytes."""
+    ram = psutil.virtual_memory()
+
+    snapshot = {
+        "timestamp": time.time(),
+        "ram": {
+            "system_total_bytes": ram.total,
+            "system_available_bytes": ram.available,
+            "comfyui_rss_bytes": psutil.Process().memory_info().rss,
+        },
+        "gpu": [],
+    }
+
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            with torch.cuda.device(index):
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+
+                snapshot["gpu"].append({
+                    "backend": "cuda",
+                    "index": index,
+                    "name": torch.cuda.get_device_name(index),
+                    "device_total_bytes": total_bytes,
+                    "device_free_bytes": free_bytes,
+                    "device_used_bytes": total_bytes - free_bytes,
+                    "torch_allocated_bytes":
+                        torch.cuda.memory_allocated(index),
+                    "torch_reserved_bytes":
+                        torch.cuda.memory_reserved(index),
+                })
+
+    else:
+        snapshot["gpu_metrics_note"] = (
+            "Detailed GPU metrics are implemented only for "
+            "devices exposed through torch.cuda."
+        )
+
+    return snapshot
+
+
+def cleanup_comfyui_memory():
+    """
+    Complete cleanup synchronously.
+
+    Exceptions propagate: Strata must not load if cleanup fails.
+    """
+    synchronize_gpu()
+    before = memory_snapshot()
+    started = time.monotonic()
+
+    model_management.unload_all_models()
+    gc.collect()
+    synchronize_gpu()
+
+    model_management.soft_empty_cache(True)
+
+    # Explicitly clear unused CUDA allocator caches on every device.
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            with torch.cuda.device(index):
+                torch.cuda.empty_cache()
+
+    gc.collect()
+    synchronize_gpu()
+
+    after = memory_snapshot()
+
+    before_gpus = {
+        gpu["index"]: gpu for gpu in before["gpu"]
+    }
+
+    delta = {
+        # Positive means the measured memory usage decreased.
+        "comfyui_rss_released_bytes": (
+            before["ram"]["comfyui_rss_bytes"]
+            - after["ram"]["comfyui_rss_bytes"]
+        ),
+        # System-wide metric; other processes can affect this value.
+        "system_available_increase_bytes": (
+            after["ram"]["system_available_bytes"]
+            - before["ram"]["system_available_bytes"]
+        ),
+        "gpu": [],
+    }
+
+    for gpu in after["gpu"]:
+        previous = before_gpus[gpu["index"]]
+
+        delta["gpu"].append({
+            "index": gpu["index"],
+            "device_free_increase_bytes": (
+                gpu["device_free_bytes"]
+                - previous["device_free_bytes"]
+            ),
+            "torch_allocated_released_bytes": (
+                previous["torch_allocated_bytes"]
+                - gpu["torch_allocated_bytes"]
+            ),
+            "torch_reserved_released_bytes": (
+                previous["torch_reserved_bytes"]
+                - gpu["torch_reserved_bytes"]
+            ),
+        })
+
+    return {
+        "enabled": True,
+        "status": "cleanup_completed",
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "before": before,
+        "after": after,
+        "delta": delta,
+        "scope": (
+            "ComfyUI model unloading, garbage collection, "
+            "unused GPU cache release, and GPU synchronization. "
+            "Live tensors and execution-cache references are retained."
+        ),
+    }
+
 class StrataLoad(StrataUnload):
     ACTION = "load"
 
-@PromptServer.instance.routes.post("/strata_simple/control")
-async def strata_simple_control(request):
-    try:
-        data = await request.json()
-        timeout = max(1, min(1800, int(data.get("timeout_s", 300))))
-        result = await asyncio.to_thread(call_strata, data.get("base_url", "http://127.0.0.1:8080"), data.get("action", "status"), timeout, data.get("api_key_env", "STRATA_API_KEY"))
-        return web.json_response({"ok": True, "result": result})
-    except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=400)
+    @classmethod
+    def INPUT_TYPES(cls):
+        config = inputs()
+
+        config["required"]["cleanup_before_load"] = (
+            "BOOLEAN",
+            {"default": False},
+        )
+
+        return config
+
+    def run(
+        self,
+        base_url,
+        timeout_s,
+        api_key_env,
+        cleanup_before_load=False,
+        trigger=None,
+    ):
+        if cleanup_before_load:
+            try:
+                cleanup = cleanup_comfyui_memory()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Pre-load memory cleanup failed. "
+                    "Strata /load was NOT called."
+                ) from exc
+        else:
+            cleanup = {
+                "enabled": False,
+                "status": "skipped",
+            }
+
+        # Reached only after cleanup and GPU synchronization finish.
+        before_load = memory_snapshot()
+        load_started = time.monotonic()
+
+        try:
+            load_response = json.loads(
+                call_strata(
+                    base_url,
+                    self.ACTION,
+                    timeout_s,
+                    api_key_env,
+                )
+            )
+        except Exception as exc:
+            failure = {
+                "action": "load",
+                "status": "load_failed",
+                "cleanup": cleanup,
+                "before_load": before_load,
+                "error": str(exc),
+            }
+
+            raise RuntimeError(
+                json.dumps(failure, ensure_ascii=False, indent=2)
+            ) from exc
+
+        report = {
+            "action": "load",
+            "status": "load_request_succeeded",
+            "cleanup": cleanup,
+            "load": {
+                "elapsed_seconds": round(
+                    time.monotonic() - load_started, 3
+                ),
+                "before": before_load,
+                "after": memory_snapshot(),
+                "api": load_response,
+            },
+        }
+
+        result = json.dumps(
+            report,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        return {
+            "ui": {"text": [result]},
+            "result": (trigger, result),
+        }
 
 NODE_CLASS_MAPPINGS = {
     "StrataSimpleControlPanel": StrataControlPanel,
