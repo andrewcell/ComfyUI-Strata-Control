@@ -1,8 +1,13 @@
 # ComfyUI-Strata-Control
 
-A lightweight ComfyUI custom node pack for controlling an already-running Strata HTTP server.
+A lightweight ComfyUI custom node pack for
+[Strata](https://github.com/Niko1221/Strata), designed to unload Strata
+before generation and reload it afterward.
 
-It provides a manual control panel and dedicated Load / Unload nodes for workflow integration, with optional ComfyUI memory cleanup before loading Strata.
+It provides a manual control panel and dedicated Load / Unload nodes,
+with optional pre-load memory cleanup and memory usage reporting.
+
+Requires an already-running Strata HTTP server.
 
 ## Features
 
@@ -42,7 +47,7 @@ No additional pip installation should be necessary in a standard compatible Comf
 Run the following command from your ComfyUI root directory:
 
 ```bash
-git clone [https://github.com/andrewcell/ComfyUI-Strata-Control.git](https://github.com/andrewcell/ComfyUI-Strata-Control.git) custom_nodes/ComfyUI-Strata-Control
+git clone https://github.com/andrewcell/ComfyUI-Strata-Control.git custom_nodes/ComfyUI-Strata-Control
 ```
 
 Restart ComfyUI, then hard-refresh your browser to reload frontend extensions.
