@@ -1,9 +1,8 @@
-# ComfyUI Strata Simple Control
+# ComfyUI-Strata-Control
 
 A lightweight ComfyUI custom node pack for controlling an already-running Strata HTTP server.
 
 It provides a manual control panel and dedicated Load / Unload nodes for workflow integration.
-
 
 ## Features
 
@@ -26,32 +25,48 @@ It provides a manual control panel and dedicated Load / Unload nodes for workflo
 ## Requirements
 
 - A working ComfyUI installation.
-- Python 3.9 or newer, with ComfyUI's existing `aiohttp` dependency.
-- An already-running Strata server exposing the endpoints listed below.
+- Python 3.9 or newer.
+- ComfyUI's existing `aiohttp` dependency.
+- An already-running Strata server exposing the supported HTTP endpoints.
 - Network access from the ComfyUI server to the Strata server.
 
 No additional pip installation is required in a standard compatible ComfyUI environment.
 
 ## Installation
 
-1. Extract the package into your ComfyUI `custom_nodes` directory.
-2. Verify that the directory structure matches the following:
+### Using Git
 
-   ```text
-   ComfyUI/
-   └── custom_nodes/
-       └── comfyui_strata_simple/
-           ├── __init__.py
-           ├── README.md
-           └── web/
-               └── control_panel.js
-   ```
+Run the following command from your ComfyUI directory:
 
-3. Restart ComfyUI.
-4. Hard-refresh your browser to reload frontend extensions.
-5. Search for `Strata` in the node menu.
+```bash
+git clone [https://github.com/andrewcell/ComfyUI-Strata-Control.git](https://github.com/andrewcell/ComfyUI-Strata-Control.git) custom_nodes/ComfyUI-Strata-Control
+```
 
-The nodes appear under the `Strata Simple` category.
+Restart ComfyUI, then hard-refresh your browser to reload frontend extensions.
+
+### Manual Installation
+
+1. Download and extract the repository.
+2. Place the extracted folder inside `ComfyUI/custom_nodes`.
+3. Ensure the folder is named `ComfyUI-Strata-Control`.
+4. Restart ComfyUI.
+5. Hard-refresh your browser.
+
+The directory structure should look like this:
+
+```text
+ComfyUI/
+└── custom_nodes/
+    └── ComfyUI-Strata-Control/
+        ├── __init__.py
+        ├── README.md
+        └── web/
+            └── control_panel.js
+```
+
+Search for `Strata` in the node menu to add the nodes.
+
+The current node category is `Strata Simple`.
 
 ## Configuration
 
@@ -60,7 +75,7 @@ All three nodes provide the following settings:
 | Setting | Default | Description |
 |---|---|---|
 | `base_url` | `http://127.0.0.1:8080` | Root URL of the Strata server. Do not append `/v1`. |
-| `timeout_s` | `300` | HTTP request timeout in seconds. |
+| `timeout_s` | `300` | HTTP request timeout in seconds. Allowed range: 1–1800. |
 | `api_key_env` | `STRATA_API_KEY` | Name of the ComfyUI server environment variable containing the Bearer token. |
 
 ### Server Address
@@ -83,7 +98,7 @@ Do not use:
 http://127.0.0.1:8080/v1
 ```
 
-URLs with embedded credentials, query strings, or non-root paths are rejected by this implementation.
+The current implementation rejects URLs containing embedded credentials, query strings, fragments, or non-root paths.
 
 ### Authentication
 
@@ -105,7 +120,7 @@ python main.py
 
 Leave `api_key_env` set to `STRATA_API_KEY`, or change it to another environment variable name.
 
-The extension reads that variable and sends:
+The extension reads the variable and sends:
 
 ```http
 Authorization: Bearer <value>
@@ -113,23 +128,23 @@ Authorization: Bearer <value>
 
 If the variable is missing or empty, no Authorization header is sent.
 
-Do not enter the actual API key into the `api_key_env` field. That field expects an environment variable name, not the token itself.
+**Important:** The `api_key_env` field expects an environment variable name, not the actual API key.
 
 Restart ComfyUI after changing the environment used to launch it.
 
-## Manual Control Panel
+## Strata Control Panel
 
 Add a `Strata Control Panel` node and configure its server address.
 
 The panel provides three buttons:
 
-| Button | Request |
-|---|---|
-| Status | `GET /health` |
-| Load | `POST /load` |
-| Unload | `POST /unload` |
+| Button | Request | Purpose |
+|---|---|---|
+| Status | `GET /health` | Queries the server's health response. |
+| Load | `POST /load` | Requests model loading. |
+| Unload | `POST /unload` | Requests model unloading. |
 
-Load and Unload require confirmation before sending the request.
+Load and Unload display a confirmation dialog before sending the request.
 
 The `last_result` field displays the response or an error message. Successful responses are also logged to the browser console.
 
@@ -141,7 +156,11 @@ Use them only when it is safe to change Strata's model state. A manual request m
 
 Executing the Control Panel as part of a graph does not automatically load or unload Strata. Its graph function only passes through its optional input and returns an informational message.
 
-## Workflow Load and Unload Nodes
+The panel's `last_result` display is separate from its graph `result` output. Clicking a button updates the display, not the graph output.
+
+## Strata Load and Strata Unload
+
+These nodes send HTTP requests when ComfyUI executes them as part of a workflow.
 
 ### Inputs
 
@@ -164,6 +183,14 @@ If `trigger` is not connected, `passthrough` returns `None`.
 Both nodes are registered as output nodes, so they can execute without a downstream connection.
 
 Their execution cache is disabled. Each time the node executes in a queued workflow, it sends a new HTTP request.
+
+### Load Does Not Start the Server
+
+`Strata Load` sends a model-loading request to an already-running Strata HTTP server.
+
+It does not launch Strata or restart a stopped server process.
+
+Likewise, `Strata Unload` requests model unloading; it does not terminate the Strata HTTP server process.
 
 ## Execution Ordering
 
@@ -207,7 +234,7 @@ Strata Unload.trigger
 
 This establishes a dependency between the unload operation and that loader.
 
-Important limitations:
+Keep the following limitations in mind:
 
 - The loader must support converting the relevant widget to an input.
 - The loader must accept the connection's type.
@@ -233,11 +260,13 @@ Strata Load.trigger
 
 This makes the Load request depend on the final image.
 
-It does not unload ComfyUI models. If ComfyUI still occupies the required VRAM, release that memory separately before loading Strata.
+In this arrangement, Save Image runs only after the Load request succeeds. A Load failure prevents that downstream Save Image node from executing.
 
-## HTTP Behavior
+The Load node does not unload ComfyUI models. If ComfyUI still occupies the required VRAM, release that memory separately before loading Strata.
 
-The extension uses these fixed endpoints:
+## HTTP API
+
+The extension uses the following fixed endpoints:
 
 | Operation | Method | Endpoint |
 |---|---|---|
@@ -254,17 +283,29 @@ Load and Unload send an empty JSON object:
 The implementation:
 
 - Treats HTTP errors and connection failures as failures.
-- Treats a JSON response with `ok: false` or a non-empty `error` field as a failure.
+- Treats a JSON response containing `ok: false` or a non-empty `error` field as a failure.
 - Checks a top-level Boolean `loaded` field when present.
+- Rejects `loaded: true` after an Unload request.
+- Rejects `loaded: false` after a Load request.
 - Does not automatically retry failed requests.
 - Does not automatically fall back to `/v1/load` or `/v1/unload`.
 - Does not independently inspect GPU memory.
 
 A successful HTTP response does not independently prove that all GPU memory has been reclaimed.
 
+### ComfyUI Control Route
+
+The manual panel uses this server-side route:
+
+```text
+POST /strata_simple/control
+```
+
+This internal route name remains unchanged regardless of the repository or installation folder name.
+
 ## Error Handling
 
-For workflow nodes, a failed request raises an error and stops execution through that node.
+For workflow nodes, a failed request raises an error and prevents dependent nodes from executing.
 
 For the manual panel, an error appears in the result field and an alert dialog.
 
@@ -284,17 +325,18 @@ A client-side timeout does not cancel an operation already accepted by Strata. C
 
 ### Nodes Do Not Appear
 
-- Confirm that `__init__.py` is directly inside `comfyui_strata_simple`.
+- Confirm that `__init__.py` is directly inside `ComfyUI-Strata-Control`.
 - Check for an extra nested directory created during extraction.
 - Restart ComfyUI.
 - Inspect the ComfyUI startup log for import errors.
+- Search for `Strata` or check the `Strata Simple` category.
 
 ### Panel Buttons Do Not Appear
 
 - Hard-refresh the browser.
 - Check the browser console for JavaScript errors.
 - Confirm that `web/control_panel.js` exists.
-- Confirm that the extension is enabled.
+- Confirm that the frontend extension is enabled.
 
 ### Connection Refused
 
@@ -302,6 +344,13 @@ A client-side timeout does not cancel an operation already accepted by Strata. C
 - Check the hostname and port.
 - Verify connectivity from the ComfyUI host or container.
 - Remember that the Load node does not start the Strata server process.
+
+### HTTP 401 or 403
+
+- Check whether your Strata server requires authentication.
+- Confirm that the configured environment variable exists in the ComfyUI process environment.
+- Confirm that the variable contains the correct API key.
+- Restart ComfyUI after changing its launch environment.
 
 ### HTTP 404
 
@@ -315,12 +364,20 @@ POST /unload
 
 The current implementation does not support configurable endpoint paths.
 
+Do not append `/v1` to `base_url`.
+
 ### Strata Unloads, but Generation Still Runs Out of Memory
 
 - Check whether independent ComfyUI model loaders ran before the unload request.
 - Add execution dependencies to all relevant loader branches.
 - Check whether another Strata client caused the model to load again.
-- Verify actual memory usage separately.
+- Verify actual GPU memory usage separately.
+
+### Passthrough Connection Is Rejected
+
+The passthrough ports use a wildcard type convention.
+
+Some frontend versions or custom nodes may reject the connection. Verify compatibility with the destination node, especially when converting dropdown or filename widgets into inputs.
 
 ## Security
 
@@ -332,14 +389,9 @@ Use this extension only in a trusted ComfyUI environment.
 - Restrict access to the ComfyUI server.
 - Keep API keys in server-side environment variables.
 - Review workflows received from other users before executing them.
+- Only send authenticated requests to trusted Strata server addresses.
 
-The custom route is:
-
-```text
-POST /strata_simple/control
-```
-
-This extension does not add its own authentication layer to that route.
+This extension does not add its own authentication layer to the custom ComfyUI route.
 
 ## Limitations
 
@@ -352,9 +404,10 @@ This extension does not add its own authentication layer to that route.
 - Does not provide a global pre-execution hook.
 - Does not guarantee execution order without explicit graph dependencies.
 - Does not include configurable API endpoint paths.
+- Does not cancel remote operations when a local HTTP request times out.
 
 ## Validation Status
 
-The package was generated and its Python syntax was checked.
+The initial package was generated and its Python syntax was checked.
 
 It has not been integration-tested against a live ComfyUI and Strata installation. Frontend compatibility, endpoint behavior, and passthrough connections should be verified in your environment before relying on automated GPU handoff.
