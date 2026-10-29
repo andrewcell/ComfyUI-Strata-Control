@@ -73,7 +73,7 @@ class StrataControlPanel:
     RETURN_TYPES = (ANY, "STRING")
     RETURN_NAMES = ("passthrough", "result")
     FUNCTION = "run"
-    CATEGORY = "Strata Simple"
+    CATEGORY = "Strata Control"
     def run(self, base_url, timeout_s, api_key_env, trigger=None):
         return (trigger, "Manual panel: use Status / Load / Unload buttons")
 
@@ -87,7 +87,7 @@ class StrataUnload:
     RETURN_TYPES = (ANY, "STRING")
     RETURN_NAMES = ("passthrough", "result")
     FUNCTION = "run"
-    CATEGORY = "Strata Simple"
+    CATEGORY = "Strata Control"
     OUTPUT_NODE = True
     ACTION = "unload"
     def run(self, base_url, timeout_s, api_key_env, trigger=None):
@@ -233,6 +233,47 @@ def cleanup_comfyui_memory():
             "Live tensors and execution-cache references are retained."
         ),
     }
+class ComfyUIMemoryCleanup:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "enabled": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "trigger": (ANY,),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    RETURN_TYPES = (ANY, "STRING")
+    RETURN_NAMES = ("passthrough", "result")
+    FUNCTION = "run"
+    CATEGORY = "Strata Control"
+    OUTPUT_NODE = True
+
+    def run(self, enabled=True, trigger=None):
+        if enabled:
+            report = cleanup_comfyui_memory()
+        else:
+            report = {
+                "enabled": False,
+                "status": "skipped",
+            }
+
+        result = json.dumps(
+            report,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        return {
+            "ui": {"text": [result]},
+            "result": (trigger, result),
+        }
 
 class StrataLoad(StrataUnload):
     ACTION = "load"
@@ -325,9 +366,12 @@ NODE_CLASS_MAPPINGS = {
     "StrataSimpleControlPanel": StrataControlPanel,
     "StrataSimpleUnload": StrataUnload,
     "StrataSimpleLoad": StrataLoad,
+    "StrataControlMemoryCleanup": ComfyUIMemoryCleanup,
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "StrataSimpleControlPanel": "Strata Control Panel",
-    "StrataSimpleUnload": "Strata Unload",
-    "StrataSimpleLoad": "Strata Load",
+    "StrataSimpleControlPanel": "Strata Control - Panel",
+    "StrataSimpleUnload": "Strata Control - Unload",
+    "StrataSimpleLoad": "Strata Control - Load",
+    "StrataControlMemoryCleanup": "Strata Control - Memory Cleanup",
 }
