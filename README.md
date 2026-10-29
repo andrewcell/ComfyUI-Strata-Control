@@ -192,6 +192,18 @@ It does not launch Strata or restart a stopped server process.
 
 Likewise, `Strata Unload` requests model unloading; it does not terminate the Strata HTTP server process.
 
+## Workflow Examples
+
+![ComfyUI-Strata-Control workflow examples](images/workflow.png)
+
+Illustrative workflow diagram showing:
+
+1. Unloading Strata before model loading.
+2. Unloading Strata before positive prompt encoding.
+3. Loading Strata after image generation.
+
+Note: Gating the positive prompt encoder does not delay independent model-loader branches.
+
 ## Execution Ordering
 
 Placing a Load or Unload node on the canvas does not establish its order relative to independent graph branches.
