@@ -77,10 +77,39 @@ class StrataControlPanel:
     def run(self, base_url, timeout_s, api_key_env, trigger=None):
         return (trigger, "Manual panel: use Status / Load / Unload buttons")
 
+def _continued_failure(action, trigger, exc):
+    error = {"type": type(exc).__name__, "message": str(exc)}
+    if exc.__cause__ is not None:
+        error["cause"] = {
+            "type": type(exc.__cause__).__name__,
+            "message": str(exc.__cause__),
+        }
+    report = {
+        "action": action,
+        "status": "failed_but_continued",
+        "continue_on_error": True,
+        "error": error,
+    }
+    try:
+        details = json.loads(str(exc))
+        if isinstance(details, dict):
+            report["failure_details"] = details
+    except (ValueError, TypeError):
+        pass
+    result = json.dumps(report, ensure_ascii=False, indent=2)
+    print(f"[Strata Control] {action} failed; continuing: {exc}")
+    return {"ui": {"text": [result]}, "result": (trigger, result)}
+
+
 class StrataUnload:
     @classmethod
     def INPUT_TYPES(cls):
-        return inputs()
+        config = inputs()
+        config["optional"]["continue_on_error"] = (
+            "BOOLEAN",
+            {"default": False, "tooltip": "Report failure and continue downstream instead of raising an error."},
+        )
+        return config
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
@@ -90,9 +119,18 @@ class StrataUnload:
     CATEGORY = "Strata Control"
     OUTPUT_NODE = True
     ACTION = "unload"
-    def run(self, base_url, timeout_s, api_key_env, trigger=None):
+    def _run_strict(self, base_url, timeout_s, api_key_env, trigger=None):
         result = call_strata(base_url, self.ACTION, timeout_s, api_key_env)
         return {"ui": {"text": [result]}, "result": (trigger, result)}
+
+    def run(self, base_url, timeout_s, api_key_env, trigger=None,
+            continue_on_error=False):
+        try:
+            return self._run_strict(base_url, timeout_s, api_key_env, trigger=trigger)
+        except Exception as exc:
+            if not continue_on_error:
+                raise
+            return _continued_failure(self.ACTION, trigger, exc)
 
 def synchronize_gpu():
     """Wait for pending GPU work before continuing."""
@@ -496,7 +534,7 @@ class StrataLoad(StrataUnload):
 
     @classmethod
     def INPUT_TYPES(cls):
-        config = inputs()
+        config = super().INPUT_TYPES()
 
         config["required"]["cleanup_before_load"] = (
             "BOOLEAN",
@@ -505,7 +543,7 @@ class StrataLoad(StrataUnload):
 
         return config
 
-    def run(
+    def _run_strict(
         self,
         base_url,
         timeout_s,
@@ -577,6 +615,18 @@ class StrataLoad(StrataUnload):
             "ui": {"text": [result]},
             "result": (trigger, result),
         }
+
+    def run(self, base_url, timeout_s, api_key_env, cleanup_before_load=False,
+            trigger=None, continue_on_error=False):
+        try:
+            return self._run_strict(
+                base_url, timeout_s, api_key_env,
+                cleanup_before_load=cleanup_before_load, trigger=trigger,
+            )
+        except Exception as exc:
+            if not continue_on_error:
+                raise
+            return _continued_failure(self.ACTION, trigger, exc)
 
 NODE_CLASS_MAPPINGS = {
     "StrataSimpleControlPanel": StrataControlPanel,
